@@ -1,0 +1,15 @@
+
+# Terraform local/state files
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/terraform.tfvars
+
+# Terraform local/cache/state
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/terraform.tfvars
+*.tfplan
+crash.log
+crash.*.log

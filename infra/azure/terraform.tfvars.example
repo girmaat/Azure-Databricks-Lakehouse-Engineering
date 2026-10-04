@@ -1,0 +1,18 @@
+# Copy to terraform.tfvars and replace values before planning/applying.
+
+databricks_host = "https://adb-REPLACE.azuredatabricks.net"
+
+# Verify this exact name from the existing Azure workspace before plan/apply.
+databricks_managed_resource_group_name = "managed-rg-adblh-dev-eus2-001"
+
+dev_monthly_budget_amount = 20
+budget_notification_emails = [
+  "replace-me@example.com"
+]
+
+# Keep aligned with the actual Portal-created budget before importing it.
+budget_start_date = "2026-10-01T00:00:00Z"
+
+# Leave false for now. Set true only when you want Terraform to add the
+# remaining Step-10 Unity Catalog grants automatically.
+enable_remaining_uc_permissions = false
