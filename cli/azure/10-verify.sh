@@ -35,3 +35,20 @@ databricks grants get-effective schema "${CATALOG}.gold" \
   -p "$DATABRICKS_PROFILE" \
   --principal "$ANALYST_GROUP" \
   -o json
+
+echo
+echo "=== Step 11 compute policy ==="
+POLICY_ID="$(databricks cluster-policies list -p "$DATABRICKS_PROFILE" -o json | \
+  POLICY_NAME="$DEV_ENGINEERING_POLICY" python -c '
+import json, os, sys
+name = os.environ["POLICY_NAME"]
+data = json.load(sys.stdin)
+items = data if isinstance(data, list) else data.get("policies", [])
+for item in items:
+    if item.get("name") == name:
+        print(item.get("policy_id", ""))
+        raise SystemExit(0)
+raise SystemExit(f"Policy not found: {name}")
+')"
+databricks cluster-policies get "$POLICY_ID" -p "$DATABRICKS_PROFILE" -o json
+databricks cluster-policies get-permissions "$POLICY_ID" -p "$DATABRICKS_PROFILE" -o json

@@ -1,0 +1,8 @@
+subscription_id = "REPLACE_NEW_SUBSCRIPTION_ID"
+tenant_id = "REPLACE_NEW_TENANT_ID"
+storage_account_name = "REPLACE_UNIQUE_STORAGE_NAME"
+# Premium is intentional: this package does not assume another trial.
+workspace_sku = "premium"
+# Enable after confirming budget support and setting the NEW contact email.
+enable_budget = false
+budget_notification_emails = []

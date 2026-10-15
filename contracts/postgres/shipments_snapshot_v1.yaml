@@ -1,0 +1,128 @@
+# Reference representation of shipments_snapshot_v1.json.
+# Keep this file aligned with the authoritative JSON contract.
+
+contract_id: postgres.fulfillment.shipments.snapshot
+contract_version: "1.0.0"
+question_id: 68
+
+dataset:
+  source_table: fulfillment.shipments
+  delivery_kind: snapshot
+  format: parquet
+  grain: One row per shipment, representing its state at extraction time.
+  primary_key:
+    - shipment_id
+  uniqueness_scope: within_one_snapshot
+  description: Full-table shipment extraction for the learning project.
+
+ownership:
+  producer_role: Project maintainer acting as the fulfillment source owner
+  consumer_role: Project maintainer acting as the lakehouse engineer
+  change_approver_role: Project maintainer
+  support_process: Record the violation and its evidence in the project issue tracker.
+
+delivery:
+  cadence: manual_on_demand
+  freshness_sla: null
+  freshness_note: No scheduled delivery or freshness SLA is promised in this exercise.
+  expected_row_count: null
+  row_count_note: The confirmed baseline has 1000 rows. Future snapshots may have different counts.
+  empty_snapshot_policy: fail
+  empty_snapshot_note: An empty shipment snapshot requires investigation before consumption.
+
+fields:
+  - name: shipment_id
+    spark_type: string
+    nullable: false
+    allow_blank: false
+    meaning: Identifier of one shipment in the fulfillment source.
+
+  - name: order_id
+    spark_type: string
+    nullable: false
+    allow_blank: false
+    meaning: Source order identifier associated with the shipment.
+
+  - name: shipment_status
+    spark_type: string
+    nullable: false
+    allow_blank: false
+    allowed_values:
+      - delivered
+      - in_transit
+    allowed_values_basis: >-
+      Project v1 policy based on currently observed values;
+      not a database CHECK constraint.
+    value_meanings:
+      delivered: Shipment has reached its delivery destination.
+      in_transit: Shipment is moving toward its delivery destination.
+
+  - name: updated_at
+    spark_type: timestamp
+    nullable: false
+    meaning: Source-reported last modification instant.
+    source_database_type: timestamp with time zone
+    consumer_timezone: UTC
+    semantic_guarantee_note: >-
+      Updating this field on every source change has not been
+      proven by the inspection.
+
+  - name: source_version
+    spark_type: bigint
+    nullable: false
+    minimum: 1
+    meaning: Source-provided shipment version.
+    minimum_basis: Project contract policy; not a database CHECK constraint.
+    semantic_guarantee_note: >-
+      A version increase on every source change has not been
+      proven by the inspection.
+
+validation:
+  required_columns: all_declared_fields
+  type_policy: exact_spark_types
+  nullability_check: inspect_actual_values
+  unique_key:
+    - shipment_id
+  extra_columns_policy: allow_and_report
+  on_violation: fail_consumer_gate
+  preserve_input: true
+  report_contract_version: true
+  report_rule_results: true
+
+time_semantics:
+  timestamp_interpretation: >-
+    An instant in time, interpreted and displayed in UTC by the consumer.
+  source_session_timezone_observed: America/New_York
+  verification_status: >-
+    Source type confirmed; extraction-to-Parquet instant preservation
+    remains to be verified.
+
+delete_semantics:
+  delete_events_included: false
+  meaning: A snapshot contains rows present at extraction time.
+  limitation: >-
+    A missing shipment does not provide an explicit delete event.
+    Deletion requires comparison with another complete snapshot
+    or a separate change-capture mechanism.
+
+change_policy:
+  additional_optional_field: Compatible; allow and report.
+  remove_required_field: Breaking; reject under this contract version.
+  change_field_type: Breaking; reject under this contract version.
+  change_grain_or_key: >-
+    Breaking; requires a new major contract version and consumer review.
+  new_status_value: >-
+    Reject until the allowed values and contract version are reviewed.
+  approval: Review contract changes in source control before use.
+
+examples:
+  illustrative_only: true
+  timestamp_representation_note: >-
+    ISO 8601 text below illustrates the instant;
+    the actual delivery uses Parquet timestamp values.
+  record:
+    shipment_id: SHP-000006
+    order_id: ORD-000006
+    shipment_status: delivered
+    updated_at: "2026-10-02T09:10:00Z"
+    source_version: 2

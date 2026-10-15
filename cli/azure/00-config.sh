@@ -20,3 +20,6 @@ export ANALYST_GROUP="${ANALYST_GROUP:-grp_adblh_dev_analysts}"
 
 export DATABRICKS_PROFILE="${DATABRICKS_PROFILE:-DEFAULT}"
 export APPLY_REMAINING_UC_PERMISSIONS="${APPLY_REMAINING_UC_PERMISSIONS:-false}"
+
+# Step 11 compute policy.
+export DEV_ENGINEERING_POLICY="${DEV_ENGINEERING_POLICY:-pol_adblh_dev_engineering}"

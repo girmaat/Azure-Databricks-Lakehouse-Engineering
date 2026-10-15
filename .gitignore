@@ -1,15 +1,33 @@
+# Generated datasets, checkpoints, test deliveries, and reports
+/data/
 
-# Terraform local/state files
-**/.terraform/
-**/*.tfstate
-**/*.tfstate.*
-**/terraform.tfvars
+# Downloaded Java and JDBC dependencies
+*.jar
 
-# Terraform local/cache/state
-**/.terraform/
-**/*.tfstate
-**/*.tfstate.*
-**/terraform.tfvars
-*.tfplan
+# Additional local Python environments
+venv/
+env/
+
+# Local environment files; retain a reusable example
+.env.*
+!.env.example
+
+# Local Databricks authentication configuration
+.databrickscfg
+
+# Terraform crash logs
 crash.log
 crash.*.log
+
+# Operating system files
+.DS_Store
+Thumbs.db
+# Terraform generated files and local configuration
+**/.terraform/
+**/terraform.tfstate*
+**/*.tfplan
+**/terraform.tfvars
+
+# Python caches
+**/__pycache__/
+*.pyc

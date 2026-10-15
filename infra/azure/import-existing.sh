@@ -111,3 +111,8 @@ fi
 echo
 echo "Import pass complete. Next run: terraform plan"
 echo "Do not apply until the plan is reviewed and any manual-vs-code differences are reconciled."
+
+# Step 11 compute policy (portal-created). Verify the policy ID in the workspace
+# before importing. Example:
+# terraform import databricks_cluster_policy.dev_engineering <POLICY_ID>
+# databricks_permissions is normally reconciled after the policy import by plan/apply.

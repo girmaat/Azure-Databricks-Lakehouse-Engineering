@@ -1,0 +1,135 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Shipment Landing Inspection
+# MAGIC
+# MAGIC Purpose: Read the shipment API response pages landed in ADLS.
+# MAGIC
+# MAGIC Delivery: shipments-2026-10-01-v1
+# MAGIC
+# MAGIC Expected page rows: 10
+# MAGIC
+# MAGIC Each page contains metadata and a nested records array.
+# MAGIC This notebook currently inspects the source files without writing tables.
+
+# COMMAND ----------
+
+shipment_pages_path = (
+    "${landing_url}"
+    "fulfillment/shipments/"
+    "delivery_id=shipments-2026-10-01-v1/"
+    "page_*.json"
+)
+
+print(f"Source path: {shipment_pages_path}")
+
+# COMMAND ----------
+
+shipment_pages_df = (
+    spark.read
+    .option("multiLine", "true")
+    .json(shipment_pages_path)
+)
+
+shipment_pages_df.printSchema()
+
+# COMMAND ----------
+
+page_count = shipment_pages_df.count()
+
+print(f"Page rows read: {page_count}")
+print("Expected page rows: 10")
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+
+expected_delivery_id = "shipments-2026-10-01-v1"
+expected_pages = 10
+expected_records_per_page = 100
+expected_total_records = 1000
+
+shipment_page_metadata_df = (
+    shipment_pages_df
+    .select(
+        "delivery_id",
+        "page_number",
+        "page_id",
+        "total_records",
+        "record_count",
+        "next_cursor",
+        F.size("records").alias("actual_record_count")
+    )
+    .orderBy("page_number")
+)
+
+# Collect only a bounded set of page metadata, not shipment records.
+page_metadata = shipment_page_metadata_df.limit(
+    expected_pages + 1
+).collect()
+
+errors = []
+
+if len(page_metadata) != expected_pages:
+    errors.append(
+        f"Expected {expected_pages} pages; "
+        f"found {len(page_metadata)} in the bounded metadata read."
+    )
+
+page_numbers = [row.page_number for row in page_metadata]
+
+if page_numbers != list(range(1, expected_pages + 1)):
+    errors.append(
+        f"Page numbers must be exactly 1–10; found {page_numbers}."
+    )
+
+page_ids = [row.page_id for row in page_metadata]
+
+if any(page_id is None or not page_id.strip() for page_id in page_ids):
+    errors.append("One or more page IDs are null or blank.")
+
+if len(set(page_ids)) != len(page_ids):
+    errors.append("Duplicate page IDs found.")
+
+for row in page_metadata:
+    page_label = f"Page {row.page_number}"
+
+    if row.delivery_id != expected_delivery_id:
+        errors.append(f"{page_label}: unexpected delivery ID.")
+
+    if row.total_records != expected_total_records:
+        errors.append(f"{page_label}: source total is not 1000.")
+
+    if row.record_count != expected_records_per_page:
+        errors.append(f"{page_label}: declared count is not 100.")
+
+    if row.actual_record_count != expected_records_per_page:
+        errors.append(f"{page_label}: actual array count is not 100.")
+
+    # This cursor rule belongs to our shipment API's current contract.
+    if row.page_number in range(1, expected_pages + 1):
+        expected_cursor = (
+            None
+            if row.page_number == expected_pages
+            else (
+                f"{expected_delivery_id}:"
+                f"{row.page_number * expected_records_per_page}"
+            )
+        )
+
+        if row.next_cursor != expected_cursor:
+            errors.append(f"{page_label}: unexpected next cursor.")
+
+    print(
+        f"{page_label} | "
+        f"declared={row.record_count} | "
+        f"actual={row.actual_record_count} | "
+        f"next_cursor={row.next_cursor}"
+    )
+
+if errors:
+    print("\nPage metadata validation: FAIL")
+    for error in errors:
+        print(f"- {error}")
+    raise ValueError("Shipment page metadata validation failed.")
+
+print("\nPage metadata validation: PASS")
