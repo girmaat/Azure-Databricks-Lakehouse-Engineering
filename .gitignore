@@ -31,3 +31,13 @@ Thumbs.db
 # Python caches
 **/__pycache__/
 *.pyc
+
+# Terraform generated files and local configuration
+**/.terraform/
+**/terraform.tfstate*
+**/*.tfplan
+**/terraform.tfvars
+
+# Python caches
+**/__pycache__/
+*.pyc
