@@ -269,7 +269,7 @@ def main():
     )
     parser.add_argument(
         "--contract",
-        default="contracts/postgres/shipments_snapshot_v1.json",
+        default="contracts/bronze/postgres/shipments_snapshot_v1.json",
     )
     parser.add_argument(
         "--input",

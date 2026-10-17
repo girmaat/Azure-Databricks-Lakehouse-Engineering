@@ -1,0 +1,27 @@
+{
+  "contract_id": "postgres.fulfillment.shipments.incremental",
+  "contract_version": "2.0.0",
+  "fields": [
+    {
+      "name": "carrier_code",
+      "required": false,
+      "spark_type": "string"
+    },
+    {
+      "name": "source_version",
+      "required": true,
+      "spark_type": "bigint"
+    },
+    {
+      "name": "shipment_status",
+      "required": true,
+      "allowed_values": [
+        "delivered",
+        "in_transit"
+      ]
+    }
+  ],
+  "validation": {
+    "on_violation": "fail_consumer_gate"
+  }
+}

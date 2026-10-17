@@ -14,7 +14,7 @@ from pyspark.sql import SparkSession, functions as F
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BASELINE = PROJECT_ROOT / "data/raw/postgres/shipments/snapshot_baseline"
 VALIDATOR = PROJECT_ROOT / "ingestion/validate_shipment_contract.py"
-CONTRACT = PROJECT_ROOT / "contracts/postgres/shipments_snapshot_v1.json"
+CONTRACT = PROJECT_ROOT / "contracts/bronze/postgres/shipments_snapshot_v1.json"
 
 RUN_ROOT = (
     PROJECT_ROOT
