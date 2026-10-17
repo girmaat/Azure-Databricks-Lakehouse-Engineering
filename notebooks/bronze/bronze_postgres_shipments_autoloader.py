@@ -853,3 +853,548 @@ display(
 
 print(f"Correction validation run: {release_run_id}")
 print(f"Repeated acceptance run: {repeat_run_id}")
+
+# COMMAND ----------
+
+# Q4 — Explicit delivery acceptance and attempt recording
+# Run this definition cell only. It does not ingest any deliveries.
+
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+
+from pyspark.sql import functions as F
+
+TABLE = "cat_adblh_dev.bronze.shipments_postgres_raw"
+RESULTS_TABLE = "cat_adblh_dev.operations.shipment_contract_results"
+ATTEMPTS_TABLE = "cat_adblh_dev.operations.shipment_ingestion_attempts"
+
+LANDING = (
+    "abfss://landing@stadblhdeveus2001.dfs.core.windows.net/"
+    "postgres/shipments"
+)
+
+CONTRACT_PATH = Path(
+    "/Workspace/Users/databricks-qa@hotmail.com/"
+    "Azure-Databricks-Lakehouse-Engineering/"
+    "contracts/bronze/postgres/shipments_incremental_v1.json"
+)
+
+RESULT_SCHEMA = """
+    run_id STRING,
+    contract_id STRING,
+    contract_version STRING,
+    delivery_id STRING,
+    source_path STRING,
+    field STRING,
+    rule STRING,
+    expected STRING,
+    observed STRING,
+    status STRING,
+    failed_rows BIGINT,
+    checked_at TIMESTAMP
+"""
+
+ATTEMPT_SCHEMA = """
+    run_id STRING,
+    delivery_id STRING,
+    source_path STRING,
+    contract_id STRING,
+    contract_version STRING,
+    input_rows BIGINT,
+    validation STRING,
+    action STRING,
+    completed_at TIMESTAMP
+"""
+
+
+def validate_and_ingest(delivery_id, source_path, replay_run_id):
+    # BLOCK A — EXPLICIT INPUTS AND CURRENT CONTRACT
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in [delivery_id, source_path, replay_run_id]
+    ):
+        raise ValueError(
+            "delivery_id, source_path, and replay_run_id "
+            "must be nonempty strings."
+        )
+
+    with CONTRACT_PATH.open("r", encoding="utf-8-sig") as handle:
+        active_contract = json.load(handle)
+
+    if (
+        active_contract["validation"]["on_violation"]
+        != "fail_consumer_gate"
+    ):
+        raise ValueError("Only fail_consumer_gate is supported.")
+
+    supported_field_keys = {
+        "name", "required", "spark_type", "allowed_values"
+    }
+    for rule in active_contract["fields"]:
+        unsupported = set(rule) - supported_field_keys
+        if unsupported:
+            raise ValueError(
+                f"Unsupported field settings: {sorted(unsupported)}"
+            )
+        if not isinstance(rule["required"], bool):
+            raise ValueError("Each required setting must be Boolean.")
+
+    # Read actual Parquet types before any output conversion.
+    data = spark.read.parquet(source_path)
+    input_rows = data.count()
+
+    if input_rows == 0:
+        raise ValueError(f"Selected delivery is empty: {source_path}")
+
+    target_schema = spark.table(TABLE).schema
+    actual_types = {
+        field.name: field.dataType.simpleString()
+        for field in data.schema.fields
+    }
+
+    results = []
+    checked_at = datetime.now(timezone.utc)
+
+    def record(name, rule, expected, observed, passed, failed_rows):
+        results.append((
+            replay_run_id,
+            active_contract["contract_id"],
+            active_contract["contract_version"],
+            delivery_id,
+            source_path,
+            name,
+            rule,
+            str(expected),
+            str(observed),
+            "PASS" if passed else "FAIL",
+            int(failed_rows),
+            checked_at,
+        ))
+
+    # BLOCK B — EXECUTE THE EXISTING CONTRACT RULES
+    for field_rule in active_contract["fields"]:
+        name = field_rule["name"]
+
+        if name not in actual_types:
+            required = field_rule["required"]
+            record(
+                name,
+                "column_presence",
+                "required" if required else "optional",
+                "absent",
+                not required,
+                input_rows if required else 0,
+            )
+            continue
+
+        if "spark_type" in field_rule:
+            expected = field_rule["spark_type"]
+            observed = actual_types[name]
+            passed = observed == expected
+            record(
+                name, "spark_type", expected, observed,
+                passed, 0 if passed else input_rows,
+            )
+
+        if "allowed_values" in field_rule:
+            allowed = field_rule["allowed_values"]
+            invalid = (
+                F.col(name).isNull()
+                | ~F.col(name).isin(*allowed)
+            )
+            failed_rows = data.filter(invalid).count()
+            record(
+                name,
+                "allowed_values",
+                json.dumps(allowed),
+                f"{failed_rows} rows outside allowed values",
+                failed_rows == 0,
+                failed_rows,
+            )
+
+    # BLOCK C — SAVE RULE EVIDENCE
+    (
+        spark.createDataFrame(results, RESULT_SCHEMA)
+        .write.format("delta")
+        .mode("append")
+        .saveAsTable(RESULTS_TABLE)
+    )
+
+    failed_rules = [
+        f"{result[5]}.{result[6]}"
+        for result in results
+        if result[9] == "FAIL"
+    ]
+
+    # BLOCK D — GATE ACCEPTANCE AND PREVENT SAME-ID REAPPEND
+    if failed_rules:
+        validation = "FAIL"
+        action = "BLOCKED"
+    else:
+        validation = "PASS"
+        already_present = (
+            spark.table(TABLE)
+            .filter(F.col("_delivery_id") == delivery_id)
+            .limit(1)
+            .count()
+        )
+
+        if already_present:
+            action = "ALREADY_PRESENT"
+        else:
+            labels = (
+                spark.table(TABLE)
+                .select("_source_system")
+                .distinct()
+                .collect()
+            )
+            if (
+                len(labels) != 1
+                or labels[0]["_source_system"] is None
+            ):
+                raise RuntimeError(
+                    "Expected one existing source-system label."
+                )
+
+            output = (
+                data
+                .withColumn(
+                    "_source_file", F.col("_metadata.file_path")
+                )
+                .withColumn(
+                    "_source_system",
+                    F.lit(labels[0]["_source_system"]),
+                )
+                .withColumn("_delivery_id", F.lit(delivery_id))
+                .withColumn("_run_id", F.lit(replay_run_id))
+                .withColumn(
+                    "_ingested_at", F.current_timestamp()
+                )
+                .withColumn(
+                    "_rescued_data", F.lit(None).cast("string")
+                )
+                .withColumn(
+                    "_containment_reason",
+                    F.lit(None).cast("string"),
+                )
+            )
+
+            for field in target_schema.fields:
+                if field.name not in output.columns:
+                    output = output.withColumn(
+                        field.name,
+                        F.lit(None).cast(field.dataType),
+                    )
+
+            (
+                output.select(*target_schema.fieldNames())
+                .write.format("delta")
+                .mode("append")
+                .saveAsTable(TABLE)
+            )
+            action = "WRITTEN"
+
+    # BLOCK E — RECORD THE COMPLETED ACCEPTANCE DECISION
+    (
+        spark.createDataFrame(
+            [(
+                replay_run_id,
+                delivery_id,
+                source_path,
+                active_contract["contract_id"],
+                active_contract["contract_version"],
+                input_rows,
+                validation,
+                action,
+                datetime.now(timezone.utc),
+            )],
+            ATTEMPT_SCHEMA,
+        )
+        .write.format("delta")
+        .mode("append")
+        .saveAsTable(ATTEMPTS_TABLE)
+    )
+
+    return {
+        "run_id": replay_run_id,
+        "delivery_id": delivery_id,
+        "source_path": source_path,
+        "input_rows": input_rows,
+        "validation": validation,
+        "failed_rules": ", ".join(failed_rules),
+        "action": action,
+    }
+
+
+print("Q4 acceptance function ready. No deliveries processed.")
+
+# COMMAND ----------
+
+# Q4 — Renamed resend demonstration
+# Requires the Q4 acceptance function definition cell.
+
+from uuid import uuid4
+from pyspark.sql import functions as F
+
+# A previously accepted, one-row learning delivery.
+delivery_id = "q3_added_field_v1"
+original_path = f"{LANDING}/delivery_id={delivery_id}/"
+resend_run_id = str(uuid4())
+
+# Separate from the normal postgres/shipments Auto Loader input.
+practice_root = (
+    "abfss://landing@stadblhdeveus2001.dfs.core.windows.net/"
+    "q4_practice/renamed_resends"
+)
+copy_folder = f"{practice_root}/{resend_run_id}"
+renamed_path = f"{copy_folder}/vendor_resend_renamed.parquet"
+
+# BLOCK A — CAPTURE THE SELECTED DELIVERY'S CURRENT BRONZE COUNT
+before_rows = (
+    spark.table(TABLE)
+    .filter(F.col("_delivery_id") == delivery_id)
+    .count()
+)
+
+if before_rows != 1:
+    raise RuntimeError(
+        f"Expected the accepted one-row delivery; found {before_rows}. "
+        "Stop without resetting or reingesting anything."
+    )
+
+# BLOCK B — COPY THE SAME FILE UNDER A DIFFERENT NAME
+source_files = [
+    item.path
+    for item in dbutils.fs.ls(original_path)
+    if item.name.lower().endswith((".parquet", ".par"))
+]
+
+if len(source_files) != 1:
+    raise RuntimeError(
+        f"Expected one source data file; found {len(source_files)}."
+    )
+
+dbutils.fs.mkdirs(copy_folder)
+
+if not dbutils.fs.cp(source_files[0], renamed_path):
+    raise RuntimeError("The practice file copy did not succeed.")
+
+# BLOCK C — ACCEPT USING THE ORIGINAL LOGICAL DELIVERY ID
+result = validate_and_ingest(
+    delivery_id=delivery_id,
+    source_path=renamed_path,
+    replay_run_id=resend_run_id,
+)
+
+# BLOCK D — SHOW THE PERSISTED ATTEMPT AND BRONZE EFFECT
+after_rows = (
+    spark.table(TABLE)
+    .filter(F.col("_delivery_id") == delivery_id)
+    .count()
+)
+
+display(
+    spark.table(ATTEMPTS_TABLE)
+    .filter(F.col("run_id") == resend_run_id)
+    .select(
+        "delivery_id",
+        "source_path",
+        "input_rows",
+        "validation",
+        "action",
+    )
+    .withColumn("bronze_before", F.lit(before_rows))
+    .withColumn("bronze_after", F.lit(after_rows))
+    .withColumn(
+        "rows_added", F.lit(after_rows - before_rows)
+    )
+)
+
+if (
+    result["validation"] != "PASS"
+    or result["action"] != "ALREADY_PRESENT"
+    or after_rows != before_rows
+):
+    raise RuntimeError("Renamed-resend outcome differs from expectation.")
+
+print("Renamed resend: PASS — no additional Bronze rows.")
+
+# COMMAND ----------
+
+# Q4 — Bounded backfill and repeat
+# Requires the Q4 acceptance function definition cell.
+# Artificial learning delivery; not a new PostgreSQL extract.
+
+from uuid import uuid4
+from pyspark.sql import functions as F
+
+existing_id = "q3_added_field_v1"
+backfill_id = "q4_historical_practice_v1"
+
+original_path = f"{LANDING}/delivery_id={existing_id}/"
+
+practice_path = (
+    "abfss://landing@stadblhdeveus2001.dfs.core.windows.net/"
+    "q4_practice/backfills/"
+    f"delivery_id={backfill_id}/"
+)
+practice_file = f"{practice_path}historical_practice.parquet"
+
+# BLOCK A — PREPARE ONE REUSABLE PRACTICE DELIVERY
+source_files = [
+    item.path
+    for item in dbutils.fs.ls(original_path)
+    if item.name.lower().endswith((".parquet", ".par"))
+]
+
+if len(source_files) != 1:
+    raise RuntimeError("Expected one original learning data file.")
+
+dbutils.fs.mkdirs(practice_path)
+
+saved_files = [
+    item.path
+    for item in dbutils.fs.ls(practice_path)
+    if item.name.lower().endswith((".parquet", ".par"))
+]
+
+if not saved_files:
+    if not dbutils.fs.cp(source_files[0], practice_file):
+        raise RuntimeError("Could not create the practice delivery.")
+elif saved_files != [practice_file]:
+    raise RuntimeError("Unexpected files in the practice delivery folder.")
+
+# BLOCK B — DECLARE THE COMPLETE BACKFILL SCOPE
+selected_deliveries = [
+    (existing_id, original_path),
+    (backfill_id, practice_file),
+]
+selected_ids = [
+    delivery_id for delivery_id, _ in selected_deliveries
+]
+
+
+def selected_bronze_counts():
+    counts = {
+        row["_delivery_id"]: row["count"]
+        for row in (
+            spark.table(TABLE)
+            .filter(F.col("_delivery_id").isin(*selected_ids))
+            .groupBy("_delivery_id")
+            .count()
+            .collect()
+        )
+    }
+    return {
+        delivery_id: counts.get(delivery_id, 0)
+        for delivery_id in selected_ids
+    }
+
+
+before = selected_bronze_counts()
+
+# BLOCK C — PROCESS ONLY THE SELECTED DELIVERIES
+first_run_id = str(uuid4())
+first_results = {
+    delivery_id: validate_and_ingest(
+        delivery_id=delivery_id,
+        source_path=source_path,
+        replay_run_id=first_run_id,
+    )
+    for delivery_id, source_path in selected_deliveries
+}
+after_first = selected_bronze_counts()
+
+# BLOCK D — REPEAT THE SAME SCOPE WITH A NEW EXECUTION ID
+repeat_run_id = str(uuid4())
+repeat_results = {
+    delivery_id: validate_and_ingest(
+        delivery_id=delivery_id,
+        source_path=source_path,
+        replay_run_id=repeat_run_id,
+    )
+    for delivery_id, source_path in selected_deliveries
+}
+after_repeat = selected_bronze_counts()
+
+# BLOCK E — ONE SUMMARY USING THE PERSISTED ATTEMPT RECORDS
+attempts = spark.table(ATTEMPTS_TABLE)
+
+first_attempts = (
+    attempts
+    .filter(F.col("run_id") == first_run_id)
+    .select(
+        "delivery_id",
+        "input_rows",
+        F.col("validation").alias("first_validation"),
+        F.col("action").alias("first_action"),
+    )
+)
+
+repeat_attempts = (
+    attempts
+    .filter(F.col("run_id") == repeat_run_id)
+    .select(
+        "delivery_id",
+        F.col("validation").alias("repeat_validation"),
+        F.col("action").alias("repeat_action"),
+    )
+)
+
+counts_summary = spark.createDataFrame(
+    [
+        (
+            delivery_id,
+            before[delivery_id],
+            after_first[delivery_id],
+            after_repeat[delivery_id],
+            after_repeat[delivery_id] - after_first[delivery_id],
+        )
+        for delivery_id in selected_ids
+    ],
+    """
+        delivery_id STRING,
+        bronze_before BIGINT,
+        bronze_after_first BIGINT,
+        bronze_after_repeat BIGINT,
+        repeat_rows_added BIGINT
+    """,
+)
+
+display(
+    first_attempts
+    .join(repeat_attempts, "delivery_id")
+    .join(counts_summary, "delivery_id")
+    .orderBy("delivery_id")
+)
+
+# BLOCK F — CHECK THIS DEMONSTRATION'S EXPECTED OUTCOMES
+for delivery_id in selected_ids:
+    first = first_results[delivery_id]
+    repeated = repeat_results[delivery_id]
+
+    expected_action = (
+        "ALREADY_PRESENT" if before[delivery_id] else "WRITTEN"
+    )
+    expected_rows = (
+        before[delivery_id]
+        if before[delivery_id]
+        else first["input_rows"]
+    )
+
+    if (
+        first["validation"] != "PASS"
+        or first["action"] != expected_action
+        or repeated["validation"] != "PASS"
+        or repeated["action"] != "ALREADY_PRESENT"
+        or after_first[delivery_id] != expected_rows
+        or after_repeat[delivery_id] != expected_rows
+    ):
+        raise RuntimeError(
+            f"Unexpected backfill outcome for {delivery_id}."
+        )
+
+print("Bounded backfill and repeat: PASS.")
+print(f"First run: {first_run_id}")
+print(f"Repeat run: {repeat_run_id}")
