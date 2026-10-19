@@ -1398,3 +1398,204 @@ for delivery_id in selected_ids:
 print("Bounded backfill and repeat: PASS.")
 print(f"First run: {first_run_id}")
 print(f"Repeat run: {repeat_run_id}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Sequence 26 Bronze Q6
+# MAGIC **A Bronze Pipeline Is Missing and Delaying Data in Production. How Would You Troubleshoot and Recover It?**
+# MAGIC Answer source: Document 02 Sources, Ingestion & Bronze.
+# MAGIC 
+# MAGIC Four phases are supplied below. Phases 1 and 2 form one read-only investigation; Phase 3 separates manual arrival, observation, and acceptance. **Prepared, not executed or verified.** Do not use Run all: historical cells include resets and writes without the contract gate. Do not rerun completed Q4 demonstrations.
+# MAGIC 
+# MAGIC In a fresh session, run only the earlier cell titled **Q4 — Explicit delivery acceptance and attempt recording** before Phase 3 acceptance. That cell defines the three-argument function without processing deliveries. The older Q70 function has a different signature.
+# MAGIC 
+# MAGIC All new expectations are artificial practice expectations. This exercise detects a withheld delivery; it does not establish a real PostgreSQL outage. Existing files, target rows, and checkpoints are retained.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Phase 1 Declare the expected input
+# MAGIC What we completed: Q4 acceptance/replay was demonstrated. Now declare one accepted delivery and one withheld practice delivery. Expected outcome: identify the exact missing input before recovery.
+# MAGIC 
+# MAGIC The next cell only defines expectations and prints the original file location. `dbutils.fs.ls` lists files; the suffix filter selects Parquet data. No file is copied yet. The withheld delivery reuses a one-row learning payload under a new delivery identity; it is not a newly extracted shipment.
+# MAGIC 
+# MAGIC Run this cell, inspect both paths, and leave the destination absent until Phase 3.
+
+# COMMAND ----------
+
+from uuid import uuid4
+from pyspark.sql import functions as F
+
+TABLE = "cat_adblh_dev.bronze.shipments_postgres_raw"
+RESULTS_TABLE = "cat_adblh_dev.operations.shipment_contract_results"
+ATTEMPTS_TABLE = "cat_adblh_dev.operations.shipment_ingestion_attempts"
+Q6_ORIGINAL = (
+    "abfss://landing@stadblhdeveus2001.dfs.core.windows.net/"
+    "postgres/shipments/delivery_id=q3_added_field_v1/"
+)
+Q6_LATE_ID = "q6_late_delivery_v1"
+Q6_LATE_PATH = (
+    "abfss://landing@stadblhdeveus2001.dfs.core.windows.net/"
+    "q6_practice/delivery_id=q6_late_delivery_v1/"
+)
+Q6_EXPECTED = [
+    ("q3_added_field_v1", Q6_ORIGINAL, 1),
+    (Q6_LATE_ID, Q6_LATE_PATH, 1),
+]
+q6_source_files = [
+    item.path for item in dbutils.fs.ls(Q6_ORIGINAL)
+    if item.name.lower().endswith((".parquet", ".par"))
+]
+if len(q6_source_files) != 1:
+    raise RuntimeError("Expected exactly one recoverable practice file.")
+print("Recoverable original:", q6_source_files[0])
+print("WITHHELD delivery:", Q6_LATE_ID)
+print("Expected destination:", Q6_LATE_PATH)
+print("Expected input: one Parquet file with one row.")
+print("No files or table rows changed.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Phase 2 Locate and explain the gap
+# MAGIC This function compares expectations with actual landing files and Bronze rows. Missing paths are classified only for recognized missing-path errors; permission and connection errors propagate. `spark.read.parquet` reads actual saved files, `count` measures rows, and `groupBy` counts Bronze rows by delivery ID. This small fixture expects files directly inside each delivery folder.
+# MAGIC 
+# MAGIC `RECONCILED` means counts agree for this selected scope; it does not certify content equality or full source completeness. If input is present but not accepted, inspect the displayed rule and attempt evidence; absence from Bronze alone does not prove rejection.
+# MAGIC 
+# MAGIC Run the next cell. Initially expect the original to be RECONCILED and q6_late_delivery_v1 to show 0 landed rows and 0 Bronze rows. The final NOT_READY error is intentional. A notebook error does not control independent downstream jobs. Stop and inspect the evidence before Phase 3.
+
+# COMMAND ----------
+
+def q6_diagnose():
+    ids = [item[0] for item in Q6_EXPECTED]
+    counts = {
+        row["_delivery_id"]: row["count"]
+        for row in spark.table(TABLE)
+        .filter(F.col("_delivery_id").isin(*ids))
+        .groupBy("_delivery_id").count().collect()
+    }
+    rows = []
+    for delivery_id, path, expected_rows in Q6_EXPECTED:
+        try:
+            entries = dbutils.fs.ls(path)
+        except Exception as error:
+            message = str(error).lower()
+            if any(marker in message for marker in (
+                "filenotfoundexception", "path_not_found", "pathnotfound"
+            )):
+                entries = []
+            else:
+                raise
+        files = [item.path for item in entries
+                 if item.name.lower().endswith((".parquet", ".par"))]
+        landed = spark.read.parquet(*files).count() if files else 0
+        bronze = counts.get(delivery_id, 0)
+        if not files:
+            diagnosis = ("MISSING_INPUT_AT_LANDING" if bronze == 0
+                         else "LANDING_MISSING_BUT_BRONZE_EXISTS")
+        elif landed != expected_rows:
+            diagnosis = "LANDED_COUNT_DIFFERS_FROM_EXPECTATION"
+        elif bronze == 0:
+            diagnosis = "LANDED_BUT_NOT_ACCEPTED"
+        elif bronze != landed:
+            diagnosis = "LANDING_BRONZE_COUNT_MISMATCH"
+        else:
+            diagnosis = "RECONCILED"
+        rows.append((delivery_id, path, expected_rows,
+                     len(files), landed, bronze, diagnosis))
+    frame = spark.createDataFrame(rows, """
+        delivery_id STRING, source_path STRING, expected_rows BIGINT,
+        landed_files BIGINT, landed_rows BIGINT, bronze_rows BIGINT,
+        diagnosis STRING
+    """)
+    display(frame.orderBy("delivery_id"))
+    for evidence_table in (RESULTS_TABLE, ATTEMPTS_TABLE):
+        if spark.catalog.tableExists(evidence_table):
+            print("Recorded evidence:", evidence_table)
+            display(spark.table(evidence_table)
+                    .filter(F.col("delivery_id").isin(*ids)))
+    unresolved = [row for row in rows if row[6] != "RECONCILED"]
+    for row in unresolved:
+        print(f"{row[0]}: {row[6]}; expected={row[2]}, "
+              f"landed={row[4]}, Bronze={row[5]}; path={row[1]}")
+    if unresolved:
+        raise RuntimeError("NOT_READY: " + ", ".join(row[0] for row in unresolved))
+    print("READY: selected practice deliveries reconcile.")
+    return frame
+
+q6_before = q6_diagnose()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Phase 3 Recover visibly
+# MAGIC ### Manual arrival before acceptance
+# MAGIC Use your storage file browser, for example Azure Storage Explorer, to copy the exact original file printed in Phase 1. In account **stadblhdeveus2001**, container **landing**, copy it from **postgres/shipments/delivery_id=q3_added_field_v1/** into **q6_practice/delivery_id=q6_late_delivery_v1/**. Create only the destination directories if needed. Copy the Parquet file only, not its parent directory or success marker. You may retain its original filename. Keep the original untouched. If your browser cannot copy, download this one file and upload it to that destination.
+# MAGIC 
+# MAGIC This changes landing only. Bronze still has zero rows for the late delivery, and no checkpoint is changed. Do not run a historical streaming cell. The destination is outside the normal postgres/shipments input.
+# MAGIC 
+# MAGIC After copying, run the observation cell below. Expect one landed row and zero Bronze rows: LANDED_BUT_NOT_ACCEPTED and NOT_READY. This second observation is a changed-state comparison, not a repeat of completed Q4 verification.
+
+# COMMAND ----------
+
+# Observe arrival separately; do not ingest in this cell.
+q6_after_arrival = q6_diagnose()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Accept only the late delivery
+# MAGIC Now call the existing Q4 function. It loads the contract, validates actual Parquet data, records rule results, and writes only passing, previously unaccepted delivery IDs. `uuid4` creates this execution ID. `filter` scopes both counts to the late delivery. No full-table reset is involved.
+# MAGIC 
+# MAGIC Run only this cell after inspecting arrival. First acceptance should return PASS, WRITTEN, before=0, after=1. On a later retry it may return ALREADY_PRESENT with before=1, after=1. These are expected outcomes, not recorded observations. The function remains single-writer and assumes immutable delivery contents; validation, Bronze, and attempts are separate commits.
+
+# COMMAND ----------
+
+q6_run_id = str(uuid4())
+q6_bronze_before = (spark.table(TABLE)
+    .filter(F.col("_delivery_id") == Q6_LATE_ID).count())
+q6_result = validate_and_ingest(
+    delivery_id=Q6_LATE_ID,
+    source_path=Q6_LATE_PATH,
+    replay_run_id=q6_run_id,
+)
+q6_bronze_after = (spark.table(TABLE)
+    .filter(F.col("_delivery_id") == Q6_LATE_ID).count())
+print(q6_result)
+print({"bronze_before": q6_bronze_before,
+       "bronze_after": q6_bronze_after,
+       "rows_added": q6_bronze_after - q6_bronze_before})
+if q6_result["validation"] != "PASS":
+    raise RuntimeError("Delivery blocked: inspect saved validation results.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Phase 4 Reconcile and record coverage
+# MAGIC Run the next cell after acceptance. It reuses the same declared scope and readiness logic. Expect both deliveries RECONCILED and READY. This is the final before-and-after recovery comparison. No additional replay suite is required.
+# MAGIC 
+# MAGIC Only after observing these results, record the real run ID and measured counts in your progress log or matching story card, then save, commit, and push. Suggested commit message: **Add missing delivery diagnosis and scoped recovery**.
+
+# COMMAND ----------
+
+q6_final = q6_diagnose()
+print("Recovery run ID:", q6_run_id)
+print("Record these observed results in the progress log; no further checks required.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Conclusion and coverage
+# MAGIC The implementation distinguishes expected input, actual landing, and accepted Bronze records. A withheld delivery should fail readiness at landing; arrival alone should remain not ready until acceptance; scoped acceptance should allow reconciliation. These Q6 outcomes remain **unverified until the cells are executed and outputs inspected**.
+# MAGIC 
+# MAGIC A suspiciously small file is an anomaly, not automatic proof of truncation. Confirm producer counts or extraction evidence before deciding whether it is incomplete. This fixture uses declared one-row expectations, not historical anomaly thresholds. Freshness deadlines, notification delivery, downstream publication gates, Silver/Gold recovery, and the small-file incident are conceptual or deferred; they are not demonstrated by this notebook. No source-certified completeness claim is made. Q6 practical coverage remains partial.
+# MAGIC 
+# MAGIC ## Interview answer
+# MAGIC First I protect consumers from incomplete publication. I compare expected deliveries with landing files, Bronze counts, validation outcomes, and ingestion attempts to locate the first unexplained gap. I distinguish absent source input from landed-but-rejected data and processing failure; a small file requires source confirmation rather than automatic rejection. I recover only affected deliveries using normal checkpoint recovery or an approved scoped acceptance path, then reconcile the affected scope. I declare data ready only after the required completeness and freshness controls pass. Downstream recovery and release must follow the actual pipeline dependencies. Job success alone does not prove data completeness.
+# MAGIC 
+# MAGIC Project evidence: Q4 demonstrated scoped replay and same-ID duplicate prevention. Q6 code is supplied for missing-delivery investigation and recovery; do not describe its expected results as executed evidence.
+# MAGIC 
+# MAGIC ## Next sequence
+# MAGIC Sequence 27 Q57, answer source Document 10 Unity Catalog Governance Security: **Lineage, Classification, Tagging, and Auditability — How Would You Prove Where Sensitive Data Came From and Who Used It?**
+# MAGIC Q6 concerns delivery completeness; Q57 concerns classification, data flow, and identity-attributed access/change evidence. Delivery IDs and ingestion run IDs do not by themselves prove who queried sensitive data.
